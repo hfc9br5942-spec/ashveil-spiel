@@ -1,0 +1,14 @@
+{
+    "name": "Ashveil.EditorTests",
+    "rootNamespace": "Ashveil.EditorTests",
+    "references": [ "Ashveil.Editor", "Ashveil.World", "Ashveil.Data", "Ashveil.Core", "Ashveil.Gameplay", "Ashveil.Rendering", "Ashveil.Maps", "Ashveil.Networking", "FishNet.Runtime", "UnityEngine.TestRunner", "UnityEditor.TestRunner" ],
+    "includePlatforms": [ "Editor" ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": true,
+    "precompiledReferences": [ "nunit.framework.dll" ],
+    "autoReferenced": false,
+    "defineConstraints": [ "UNITY_INCLUDE_TESTS" ],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

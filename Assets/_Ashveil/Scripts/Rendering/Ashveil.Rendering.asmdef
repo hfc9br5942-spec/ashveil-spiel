@@ -1,0 +1,19 @@
+{
+    "name": "Ashveil.Rendering",
+    "rootNamespace": "Ashveil.Rendering",
+    "references": [
+        "Ashveil.Core",
+        "Ashveil.World",
+        "Unity.RenderPipelines.Core.Runtime",
+        "Unity.RenderPipelines.Universal.Runtime"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

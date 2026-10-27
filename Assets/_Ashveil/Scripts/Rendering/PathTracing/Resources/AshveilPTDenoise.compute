@@ -1,0 +1,204 @@
+// ASHVEIL Pathtracer – Entrauschen (V1) und adaptive Abtastung.
+//
+// Entrauschen: kantenerhaltender A-Trous-Wavelet-Filter (Dammertz et al. 2010, Gewichte wie SVGF) auf der
+// albedo-bereinigten Beleuchtung: Texturen werden vorher herausgerechnet und danach wieder aufmultipliziert,
+// dadurch bleiben Details erhalten (§73). Der Luminanz-Term richtet sich nach der gemessenen Varianz des
+// Mittelwerts – je weiter das Bild konvergiert, desto weniger wird gefiltert; bei sauberem Bild praktisch nichts (§77).
+//
+// Adaptive Abtastung (§67–70): je Kachel der relative Standardfehler (95. Perzentil der Pixel), gewichtet mit
+// Wahrnehmung (dunkle Bereiche verzeihen mehr, Kanten und Hero-Bereich weniger). Kacheln unter der Schwelle
+// bekommen keine Proben mehr.
+#pragma kernel AshPrepare
+#pragma kernel AshAtrous
+#pragma kernel AshFinish
+#pragma kernel AshAdaptive
+#pragma kernel AshExposure
+
+Texture2D<float4> _AshPTAccumTex;
+Texture2D<float4> _AshPTMomentsTex;
+Texture2D<float4> _AshPTAlbedoTex;
+Texture2D<float4> _AshPTNormalDepthTex;
+
+RWTexture2D<float4> _AshIrrA;       // rgb Beleuchtung, a Varianz (Luminanz, des Mittelwerts)
+RWTexture2D<float4> _AshIrrB;
+Texture2D<float4> _AshIrrIn;
+RWTexture2D<float4> _AshGuide;      // xyz Normale, w Tiefe
+Texture2D<float4> _AshGuideIn;
+RWTexture2D<float4> _AshDenoised;
+RWTexture2D<float> _AshActive;
+RWStructuredBuffer<uint> _AshCounters;
+
+float4 _AshSize;          // x Breite, y Hoehe
+float4 _AshAtrousParams;  // x Schrittweite, y Sigma Luminanz, z Sigma Normale (Exponent), w Sigma Tiefe
+float4 _AshAdaptiveParams; // x Kachel, y Mindestproben, z Zielfehler, w Probenziel
+float4 _AshHeroRect;      // xy min, zw max (Pixel) – Hero-Bereich mit strengerem Ziel; z<x = aus
+
+static const float kKernel[3] = { 3.0 / 8.0, 1.0 / 4.0, 1.0 / 16.0 };
+
+float Lum(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
+
+[numthreads(8, 8, 1)]
+void AshPrepare(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_AshSize.x || id.y >= (uint)_AshSize.y) return;
+    float4 acc = _AshPTAccumTex[id.xy];
+    float n = max(acc.a, 1.0);
+    float3 c = acc.rgb / n;
+    float3 alb = _AshPTAlbedoTex[id.xy].rgb / n;
+    float4 nd = _AshPTNormalDepthTex[id.xy];
+    float4 m = _AshPTMomentsTex[id.xy];
+    float mean = m.x / n;
+    float var = max(0.0, m.y / n - mean * mean) / n;   // Varianz des Mittelwerts
+    if (n < 16.0)
+    {
+        // Wenige Proben: die Schaetzung je Pixel ist unzuverlaessig → raeumliche Varianz der Nachbarschaft (wie SVGF)
+        float s1 = 0, s2 = 0, cnt = 0;
+        for (int y = -2; y <= 2; y++)
+        for (int x = -2; x <= 2; x++)
+        {
+            int2 q = clamp(int2(id.xy) + int2(x, y), int2(0, 0), int2(_AshSize.xy) - 1);
+            float4 a = _AshPTAccumTex[q];
+            float l = Lum(a.rgb / max(a.a, 1.0));
+            s1 += l; s2 += l * l; cnt += 1;
+        }
+        float ms = s1 / cnt;
+        var = max(var, max(0.0, s2 / cnt - ms * ms));
+    }
+    float3 irr = c / max(alb, 0.02);
+    float lumAlb = Lum(max(alb, 0.02));
+    _AshIrrA[id.xy] = float4(irr, var / max(lumAlb * lumAlb, 1e-4));
+    float3 nrm = nd.xyz / n;
+    _AshGuide[id.xy] = float4(dot(nrm, nrm) > 1e-8 ? normalize(nrm) : float3(0, 0, 0), nd.w / n);
+}
+
+[numthreads(8, 8, 1)]
+void AshAtrous(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_AshSize.x || id.y >= (uint)_AshSize.y) return;
+    float4 center = _AshIrrIn[id.xy];
+    float4 gc = _AshGuideIn[id.xy];
+    if (gc.w <= 0.0) { _AshIrrB[id.xy] = center; return; }   // Himmel: nicht filtern
+
+    int step = (int)_AshAtrousParams.x;
+    float lc = Lum(center.rgb);
+    float sigmaL = _AshAtrousParams.y * sqrt(max(center.a, 0.0)) + 1e-6;
+    // Tiefengradient fuer den Tiefenterm
+    float4 gx = _AshGuideIn[uint2(min(id.x + 1, (uint)_AshSize.x - 1), id.y)];
+    float4 gy = _AshGuideIn[uint2(id.x, min(id.y + 1, (uint)_AshSize.y - 1))];
+    float dz = max(abs(gx.w - gc.w), abs(gy.w - gc.w));
+
+    float3 sum = 0;
+    float vsum = 0, wsum = 0;
+    [unroll] for (int y = -2; y <= 2; y++)
+    [unroll] for (int x = -2; x <= 2; x++)
+    {
+        int2 q = int2(id.xy) + int2(x, y) * step;
+        if (q.x < 0 || q.y < 0 || q.x >= (int)_AshSize.x || q.y >= (int)_AshSize.y) continue;
+        float4 s = _AshIrrIn[q];
+        float4 g = _AshGuideIn[q];
+        if (g.w <= 0.0) continue;
+        float k = kKernel[abs(x)] * kKernel[abs(y)];
+        float wn = pow(saturate(dot(gc.xyz, g.xyz)), _AshAtrousParams.z);
+        float wz = exp(-abs(g.w - gc.w) / (_AshAtrousParams.w * dz * step + 1e-3));
+        float wl = exp(-abs(Lum(s.rgb) - lc) / sigmaL);
+        float w = k * wn * wz * wl;
+        sum += s.rgb * w;
+        vsum += s.a * w * w;
+        wsum += w;
+    }
+    _AshIrrB[id.xy] = wsum > 0 ? float4(sum / wsum, vsum / (wsum * wsum)) : center;
+}
+
+[numthreads(8, 8, 1)]
+void AshFinish(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_AshSize.x || id.y >= (uint)_AshSize.y) return;
+    float4 acc = _AshPTAccumTex[id.xy];
+    float n = max(acc.a, 1.0);
+    float4 g = _AshGuideIn[id.xy];
+    if (g.w <= 0.0) { _AshDenoised[id.xy] = float4(acc.rgb / n, 1); return; }
+    float3 alb = _AshPTAlbedoTex[id.xy].rgb / n;
+    _AshDenoised[id.xy] = float4(_AshIrrIn[id.xy].rgb * max(alb, 0.02), 1);
+}
+
+// Eine Gruppe je Kachel (8×8 Pixel = 64 Threads)
+groupshared float gsErr[64];
+groupshared uint gsForce;
+
+[numthreads(8, 8, 1)]
+void AshAdaptive(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi : SV_GroupIndex)
+{
+    int tile = (int)_AshAdaptiveParams.x;
+    uint2 base = gid.xy * tile;
+    if (gi == 0) gsForce = 0;
+    GroupMemoryBarrierWithGroupSync();
+    float worst = 0;
+    // bei Kacheln groesser 8 laufen mehrere Pixel je Thread
+    for (int yy = tid.y; yy < tile; yy += 8)
+    for (int xx = tid.x; xx < tile; xx += 8)
+    {
+        uint2 p = base + uint2(xx, yy);
+        if (p.x >= (uint)_AshSize.x || p.y >= (uint)_AshSize.y) continue;
+        float4 acc = _AshPTAccumTex[p];
+        float n = max(acc.a, 1.0);
+        if (_AshAdaptiveParams.w > 0 && acc.a >= _AshAdaptiveParams.w) continue;   // Probenziel erreicht
+        if (acc.a < _AshAdaptiveParams.y) { InterlockedOr(gsForce, 1u); continue; }
+        float4 m = _AshPTMomentsTex[p];
+        float mean = m.x / n;
+        float var = max(0.0, m.y / n - mean * mean);
+        // Wahrnehmung: Fehler relativ zur Helligkeit, aber dunkle Bereiche mit Sockel (Auge sieht dort wenig)
+        float err = sqrt(var / n) / (mean + 0.02);
+        bool hero = _AshHeroRect.z > _AshHeroRect.x && p.x >= _AshHeroRect.x && p.y >= _AshHeroRect.y && p.x <= _AshHeroRect.z && p.y <= _AshHeroRect.w;
+        if (hero) err *= 2.0;   // Hero-Bereich: doppelt so streng (verteilt nur Proben um, aendert kein Licht)
+        worst = max(worst, err);
+    }
+    gsErr[gi] = worst;
+    GroupMemoryBarrierWithGroupSync();
+    if (gi == 0)
+    {
+        // 95. Perzentil ≈ zweitgroesster Wert von 64 → robust gegen einzelne Ausreisser-Pixel
+        float m1 = 0, m2 = 0;
+        for (int i = 0; i < 64; i++)
+        {
+            float e = gsErr[i];
+            if (e > m1) { m2 = m1; m1 = e; }
+            else if (e > m2) m2 = e;
+        }
+        bool active = gsForce != 0 || m2 > _AshAdaptiveParams.z;
+        _AshActive[gid.xy] = active ? 1.0 : 0.0;
+        if (active) InterlockedAdd(_AshCounters[3], 1u);
+    }
+}
+
+// ------------------------------------------------------------------ Belichtungs-Abgleich
+// Mittlere Log-Luminanz eines Bildes (64×64 Stichproben): Pathtracing-Summe (a = Probenzahl) oder Rasterfarbe.
+// Aus beiden ergibt sich die Kamera-Belichtung, mit der das Pathtracing-Bild so hell wirkt wie das Spielbild –
+// das Licht selbst bleibt physikalisch, nur die Kamera passt sich an (§164).
+Texture2D<float4> _AshExpSrc;
+RWStructuredBuffer<float> _AshExpOut;
+float4 _AshExpParams;   // x Breite, y Hoehe, z 1 = Summe/Probenzahl, w Zielindex
+groupshared float gsLog[256];
+
+[numthreads(16, 16, 1)]
+void AshExposure(uint3 tid : SV_GroupThreadID, uint gi : SV_GroupIndex)
+{
+    float sum = 0;
+    [unroll] for (int j = 0; j < 4; j++)
+    [unroll] for (int i = 0; i < 4; i++)
+    {
+        float2 uv = (float2(tid.x * 4 + i, tid.y * 4 + j) + 0.5) / 64.0;
+        uint2 p = min(uint2(uv * _AshExpParams.xy), uint2(_AshExpParams.xy) - 1);
+        float4 c = _AshExpSrc[p];
+        float3 rgb = _AshExpParams.z > 0.5 ? c.rgb / max(c.a, 1.0) : c.rgb;
+        float l = Lum(max(rgb, 0.0));
+        sum += log(l + 1e-3);
+    }
+    gsLog[gi] = sum / 16.0;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint stride = 128; stride > 0; stride >>= 1)
+    {
+        if (gi < stride) gsLog[gi] += gsLog[gi + stride];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi == 0) _AshExpOut[(uint)_AshExpParams.w] = gsLog[0] / 256.0;
+}

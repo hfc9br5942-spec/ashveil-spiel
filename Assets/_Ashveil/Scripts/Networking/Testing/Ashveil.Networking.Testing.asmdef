@@ -1,0 +1,27 @@
+{
+    "name": "Ashveil.Networking.Testing",
+    "rootNamespace": "Ashveil.Networking",
+    "references": [
+        "Ashveil.Networking",
+        "Ashveil.Core",
+        "Ashveil.Data",
+        "Ashveil.Gameplay",
+        "Ashveil.World",
+        "FishNet.Runtime",
+        "GameKit.Dependencies",
+        "Unity.AI.Navigation",
+        "Ashveil.Rendering",
+        "Ashveil.UI",
+        "Ashveil.Maps",
+        "Unity.InputSystem"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

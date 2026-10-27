@@ -1,0 +1,127 @@
+// ASHVEIL Dynamisches GI – Strahlergebnisse in die Proben einmischen (DDGI): je Probe 8×8 Oktaeder-Texel Licht
+// (kosinusgewichtet) und 8×8 Texel Abstand (Mittel und Quadrat fuer die Sichtbarkeitspruefung). Traege
+// Nachfuehrung (Hysterese), bei grossen Aenderungen schneller. Proben, die ueberwiegend Rueckseiten sehen, stecken in
+// Geometrie und werden abgeschaltet (kein Lichtleck).
+#pragma kernel AshGIBlend
+#pragma kernel AshGIClear
+
+#include "../ShaderLibrary/AshGICommon.hlsl"
+
+#define ASH_PI 3.14159265358979
+#define MAX_RAYS 256
+
+StructuredBuffer<float4> _AshGIRaysIn;
+RWTexture2DArray<float4> _AshGIIrradianceRW;
+RWTexture2DArray<float4> _AshGIDistanceRW;
+RWStructuredBuffer<int4> _AshGIStateRW;
+float4x4 _AshGIRotation;
+float4 _AshGIUpdate;      // x erster Probenindex, y Proben, z Strahlen je Probe, w max. Abstand
+float4 _AshGIBlendParams; // x Hysterese Licht, y Hysterese Abstand, z Schwelle Rueckseiten, w Abstands-Exponent
+
+groupshared float4 sRay[MAX_RAYS];
+groupshared float3 sDir[MAX_RAYS];
+groupshared uint sBack;
+groupshared int4 sState;
+
+float3 Fibonacci(float i, float n)
+{
+    const float PHI = 1.61803398875;
+    float phi = 2.0 * ASH_PI * frac(i * (PHI - 1.0));
+    float cosT = 1.0 - (2.0 * i + 1.0) / n;
+    float sinT = sqrt(saturate(1.0 - cosT * cosT));
+    return float3(cos(phi) * sinT, sin(phi) * sinT, cosT);
+}
+
+float Lum(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
+
+[numthreads(8, 8, 1)]
+void AshGIBlend(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi : SV_GroupIndex)
+{
+    uint k = gid.x;
+    uint rays = min((uint)_AshGIUpdate.z, (uint)MAX_RAYS);
+    uint total = AshGICount() * (uint)_AshGIGrid.w;
+    uint g = ((uint)_AshGIUpdate.x + k) % total;
+    int c = (int)(g / AshGICount());
+    uint slot = g % AshGICount();
+    int3 s = AshGISlotCoords(slot);
+    float4 cas = AshGICascade(c);
+    int3 cell = AshGICellForSlot(s, int3(cas.xyz));
+    uint stateIdx = slot + (uint)c * AshGICount();
+
+    if (gi == 0) { sBack = 0; sState = _AshGIStateRW[stateIdx]; }
+    GroupMemoryBarrierWithGroupSync();
+    for (uint i = gi; i < rays; i += 64)
+    {
+        float4 v = _AshGIRaysIn[k * rays + i];
+        sRay[i] = v;
+        sDir[i] = normalize(mul((float3x3)_AshGIRotation, Fibonacci((float)i, (float)rays)));
+        if (v.a < 0) InterlockedAdd(sBack, 1u);
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    int4 st = sState;
+    bool fresh = st.x != cell.x || st.y != cell.y || st.z != cell.z || (st.w & 1) == 0;
+    float3 dir = AshGIOctDecode((float2(tid.xy) + 0.5) / ASH_GI_TILE);
+    float3 irr = 0;
+    float wIrr = 0;
+    float2 dist = 0;
+    float wDist = 0;
+    float maxD = _AshGIUpdate.w;
+    for (uint j = 0; j < rays; j++)
+    {
+        float4 v = sRay[j];
+        float cosT = dot(dir, sDir[j]);
+        if (v.a >= 0)
+        {
+            float w = max(0.0, cosT);
+            irr += v.rgb * w;
+            wIrr += w;
+        }
+        float wd = pow(max(0.0, cosT), _AshGIBlendParams.w);
+        float d = min(abs(v.a), maxD);
+        dist += float2(d, d * d) * wd;
+        wDist += wd;
+    }
+    irr = wIrr > 1e-5 ? irr / wIrr : 0;
+    dist = wDist > 1e-5 ? dist / wDist : float2(maxD, maxD * maxD);
+
+    int2 o = AshGITileOrigin(s);
+    int3 px = int3(o + int2(tid.xy), c);
+    float4 oldI = _AshGIIrradianceRW[px];
+    float4 oldD = _AshGIDistanceRW[px];
+    float hI = fresh ? 0.0 : _AshGIBlendParams.x;
+    float hD = fresh ? 0.0 : _AshGIBlendParams.y;
+    // Grosse Aenderung (Tag/Nacht, Tuer auf, Feuer an): schneller nachziehen
+    float lo = Lum(oldI.rgb), ln = Lum(irr);
+    // 10.10.2026: 0,9 statt 0,8 – das Nachziehen bleibt ein Uebergang (ca. 1 s), kein Sprung (CORE-009, nichts Immersionsbrechendes)
+    if (!fresh && abs(ln - lo) > 0.25 * max(max(ln, lo), 0.05)) hI = min(hI, 0.9);
+    _AshGIIrradianceRW[px] = float4(lerp(irr, oldI.rgb, hI), 1);
+    _AshGIDistanceRW[px] = float4(lerp(dist, oldD.rg, hD), 0, 1);
+
+    GroupMemoryBarrierWithGroupSync();
+    if (gi == 0)
+    {
+        // 10.10.2026 (Flacker-Probe/-Rekorder am Muldentor, Spieltest r2.3): Der Rueckseiten-Anteil schwankt mit der zufaelligen
+        // Strahlendrehung je Auffrischung. Eine Probe nahe der Schwelle (Boden unter einem Hang) kippte deshalb alle paar Bilder
+        // zwischen "gueltig" und "in Geometrie" – und der Boden sprang mit gerader Zellkante zwischen Probenlicht und Rueckfall
+        // (42→58 Helligkeit in einem Bild). Jetzt: Anteil geglaettet (Bits 8–15 des Zustands) und Hysterese-Band
+        // (rein ab 1,25 × Schwelle, raus erst unter 0,75 × Schwelle).
+        float anteil = (float)sBack / max((float)rays, 1.0);
+        float alt = (float)((st.w >> 8) & 255) / 255.0;
+        float neu = fresh ? anteil : lerp(alt, anteil, 0.25);
+        bool warDrin = !fresh && (st.w & 2) != 0;
+        float schwelle = _AshGIBlendParams.z;
+        bool drin = warDrin ? (neu > schwelle * 0.75) : (neu > schwelle * 1.25);
+        int flags = 1 | (drin ? 2 : 0) | (((int)round(saturate(neu) * 255.0)) << 8);
+        _AshGIStateRW[stateIdx] = int4(cell, flags);
+    }
+}
+
+// Alles ungueltig (Start, Kaskaden neu)
+[numthreads(64, 1, 1)]
+void AshGIClear(uint3 id : SV_DispatchThreadID)
+{
+    uint total = AshGICount() * (uint)_AshGIGrid.w;
+    if (id.x >= total) return;
+    _AshGIStateRW[id.x] = int4(-2147483647, -2147483647, -2147483647, 0);
+}

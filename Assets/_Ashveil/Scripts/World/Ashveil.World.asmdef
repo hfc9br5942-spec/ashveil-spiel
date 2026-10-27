@@ -1,0 +1,14 @@
+{
+    "name": "Ashveil.World",
+    "rootNamespace": "Ashveil.World",
+    "references": [ "Ashveil.Core" ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

@@ -1,0 +1,20 @@
+{
+    "name": "Ashveil.Gameplay",
+    "rootNamespace": "Ashveil.Gameplay",
+    "references": [ "Ashveil.Core", "Ashveil.Data", "Unity.InputSystem", "SteamAudioUnity" ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [
+        {
+            "name": "com.unity.inputsystem",
+            "expression": "1.0.0",
+            "define": "ASHVEIL_INPUT_SYSTEM"
+        }
+    ],
+    "noEngineReferences": false
+}

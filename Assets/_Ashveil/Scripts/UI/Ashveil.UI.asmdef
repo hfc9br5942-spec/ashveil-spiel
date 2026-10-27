@@ -1,0 +1,14 @@
+{
+    "name": "Ashveil.UI",
+    "rootNamespace": "Ashveil.UI",
+    "references": [ "Ashveil.Core", "Ashveil.Data", "Ashveil.Gameplay", "Ashveil.World", "Ashveil.Rendering", "Unity.TextMeshPro", "UnityEngine.UI" ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}
